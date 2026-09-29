@@ -3,35 +3,34 @@
 # One-time production server setup for the Lapinou backend.
 # Run this ONCE on a fresh Ubuntu/Debian server (as a user with sudo rights).
 #
-# It installs Docker, clones the deploy repo (docker-compose.prod.yml + deploy/,
-# NOT the backend app source), generates the .env file, logs in to GHCR, and
-# obtains a Let's Encrypt SSL certificate via Nginx + Certbot.
+# It installs Docker, clones the infra repo (docker-compose.prod.yml +
+# deploy/) and the backend app repo (source + Dockerfile), generates the
+# .env file, builds the backend image locally, and obtains a Let's Encrypt
+# SSL certificate via Nginx + Certbot.
 #
-# NOTE: docker-compose.prod.yml and deploy/ live at the root of the lapinou/
-# monorepo, which currently has no git repo of its own (only backend/ and
-# mobile_app/ are pushed separately, as lapinou-backend and lapinou-mobile-app).
-# --repo below MUST point to a repo that actually contains these two, or the
-# clone/pull steps in this script will fail as-is.
+# Both repos are private, so the server needs its own git credentials for
+# each (SSH deploy key, or an HTTPS URL containing a token) -- see --repo
+# and --backend-repo below. There is no Docker registry involved: the image
+# is built on the server itself and never pushed/pulled anywhere.
 #
-# Sensitive values (DB password, Django secret key, GHCR token) are NEVER
-# hardcoded here: pass them as flags, or leave them out and you will be
-# prompted for them with hidden input.
+# Sensitive values (DB password, Django secret key) are NEVER hardcoded
+# here: pass them as flags, or leave them out and you will be prompted for
+# them with hidden input.
 #
 # Usage example:
 #   ./setup-server.sh \
 #     --domain api.lapinou.example \
-#     --email admin@lapinou.example \
-#     --ghcr-user elienoel
+#     --email admin@lapinou.example
 #
-# (DB password / secret key / GHCR token will then be prompted interactively.)
+# (DB password / secret key will then be prompted interactively.)
 
 set -euo pipefail
 
 # ---------- Defaults ----------
-# TODO: this must point to a repo containing docker-compose.prod.yml + deploy/
-# at its root (e.g. a future "lapinou" monorepo repo) -- NOT lapinou-backend,
-# since those files no longer live inside the backend app repo.
-REPO_URL="https://github.com/elienoel/lapinou.git"
+# Infra repo: contains docker-compose.prod.yml + deploy/ at its root.
+REPO_URL="https://github.com/elienoel/lapinou-archi.git"
+# Backend app repo: contains the Django source + Dockerfile.
+BACKEND_REPO_URL="https://github.com/elienoel/lapinou-backend.git"
 BRANCH="prod"
 DEPLOY_PATH="/opt/lapinou"
 DB_NAME="lapinou"
@@ -41,13 +40,6 @@ SECRET_KEY=""
 DOMAIN=""
 EMAIL=""
 ALLOWED_HOSTS=""
-GHCR_USER=""
-GHCR_TOKEN=""
-SKIP_GHCR_LOGIN=0
-# Name of the backend app repo on GHCR (ghcr.io/<user>/<this>:latest) -- the
-# CI workflow lives in that repo and derives the image name the same way, so
-# this must match its name even though we no longer clone that repo here.
-BACKEND_IMAGE_REPO="lapinou-backend"
 
 # ---------- Parse arguments ----------
 while [ $# -gt 0 ]; do
@@ -55,6 +47,7 @@ while [ $# -gt 0 ]; do
         --domain) DOMAIN="$2"; shift 2 ;;
         --email) EMAIL="$2"; shift 2 ;;
         --repo) REPO_URL="$2"; shift 2 ;;
+        --backend-repo) BACKEND_REPO_URL="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         --deploy-path) DEPLOY_PATH="$2"; shift 2 ;;
         --db-name) DB_NAME="$2"; shift 2 ;;
@@ -62,10 +55,6 @@ while [ $# -gt 0 ]; do
         --db-password) DB_PASSWORD="$2"; shift 2 ;;
         --secret-key) SECRET_KEY="$2"; shift 2 ;;
         --allowed-hosts) ALLOWED_HOSTS="$2"; shift 2 ;;
-        --ghcr-user) GHCR_USER="$2"; shift 2 ;;
-        --ghcr-token) GHCR_TOKEN="$2"; shift 2 ;;
-        --backend-image-repo) BACKEND_IMAGE_REPO="$2"; shift 2 ;;
-        --skip-ghcr-login) SKIP_GHCR_LOGIN=1; shift ;;
         -h|--help)
             grep '^#' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -78,7 +67,6 @@ done
 [ -z "$DOMAIN" ] && read -r -p "Domain name (e.g. api.lapinou.example): " DOMAIN
 [ -z "$EMAIL" ] && read -r -p "Email for Let's Encrypt renewal notices: " EMAIL
 [ -z "$ALLOWED_HOSTS" ] && ALLOWED_HOSTS="$DOMAIN"
-[ -z "$GHCR_USER" ] && read -r -p "GitHub username/org that owns the GHCR image: " GHCR_USER
 
 if [ -z "$DB_PASSWORD" ]; then
     read -r -s -p "PostgreSQL password for user '$DB_USER': " DB_PASSWORD
@@ -94,22 +82,13 @@ if [ -z "$SECRET_KEY" ]; then
     fi
 fi
 
-if [ "$SKIP_GHCR_LOGIN" -eq 0 ] && [ -z "$GHCR_TOKEN" ]; then
-    read -r -s -p "GitHub Personal Access Token (read:packages scope, leave empty to skip GHCR login): " GHCR_TOKEN
-    echo
-fi
-
-IMAGE_OWNER="$(echo "$GHCR_USER" | tr '[:upper:]' '[:lower:]')"
-REPO_NAME="$(echo "$BACKEND_IMAGE_REPO" | tr '[:upper:]' '[:lower:]')"
-BACKEND_IMAGE="ghcr.io/${IMAGE_OWNER}/${REPO_NAME}:latest"
-
 echo
 echo "== Configuration summary =="
-echo "Domain:        $DOMAIN"
-echo "Deploy path:   $DEPLOY_PATH"
-echo "Repo/branch:   $REPO_URL @ $BRANCH"
-echo "Backend image: $BACKEND_IMAGE"
-echo "DB name/user:  $DB_NAME / $DB_USER"
+echo "Domain:         $DOMAIN"
+echo "Deploy path:    $DEPLOY_PATH"
+echo "Infra repo:     $REPO_URL @ $BRANCH"
+echo "Backend repo:   $BACKEND_REPO_URL @ $BRANCH"
+echo "DB name/user:   $DB_NAME / $DB_USER"
 echo
 
 # ---------- 1. Install base packages (git, envsubst) ----------
@@ -133,9 +112,9 @@ if groups "$USER" | grep -qw docker; then
     DOCKER="docker"
 fi
 
-# ---------- 3. Clone or update the repo ----------
+# ---------- 3. Clone or update the infra repo ----------
 if [ -d "$DEPLOY_PATH/.git" ]; then
-    echo "Repo already present at $DEPLOY_PATH, pulling latest $BRANCH..."
+    echo "Infra repo already present at $DEPLOY_PATH, pulling latest $BRANCH..."
     git -C "$DEPLOY_PATH" fetch origin "$BRANCH"
     git -C "$DEPLOY_PATH" checkout "$BRANCH"
     git -C "$DEPLOY_PATH" pull origin "$BRANCH"
@@ -146,9 +125,21 @@ else
     sudo chown -R "$USER":"$USER" "$DEPLOY_PATH"
 fi
 
+# ---------- 4. Clone or update the backend app repo ----------
+BACKEND_PATH="$DEPLOY_PATH/backend"
+if [ -d "$BACKEND_PATH/.git" ]; then
+    echo "Backend repo already present at $BACKEND_PATH, pulling latest $BRANCH..."
+    git -C "$BACKEND_PATH" fetch origin "$BRANCH"
+    git -C "$BACKEND_PATH" checkout "$BRANCH"
+    git -C "$BACKEND_PATH" pull origin "$BRANCH"
+else
+    echo "Cloning $BACKEND_REPO_URL ($BRANCH) into $BACKEND_PATH..."
+    git clone --branch "$BRANCH" "$BACKEND_REPO_URL" "$BACKEND_PATH"
+fi
+
 cd "$DEPLOY_PATH"
 
-# ---------- 4. Generate .env ----------
+# ---------- 5. Generate .env ----------
 cat > .env <<EOF
 DEBUG=False
 SECRET_KEY=${SECRET_KEY}
@@ -158,22 +149,16 @@ DB_NAME=${DB_NAME}
 DB_USER=${DB_USER}
 DB_PASSWORD=${DB_PASSWORD}
 DOMAIN=${DOMAIN}
-BACKEND_IMAGE=${BACKEND_IMAGE}
 EOF
 chmod 600 .env
 echo ".env written to $DEPLOY_PATH/.env"
 
-# ---------- 5. Generate nginx.conf from template ----------
+# ---------- 6. Generate nginx.conf from template ----------
 DOMAIN="$DOMAIN" envsubst '${DOMAIN}' < deploy/nginx.conf.template > deploy/nginx.conf
 echo "deploy/nginx.conf generated for domain $DOMAIN"
 
-# ---------- 6. Log in to GHCR (needed if the package is private) ----------
-if [ "$SKIP_GHCR_LOGIN" -eq 0 ] && [ -n "$GHCR_TOKEN" ]; then
-    echo "$GHCR_TOKEN" | $DOCKER login ghcr.io -u "$GHCR_USER" --password-stdin
-fi
-
-# ---------- 7. Pull the backend image ----------
-$DOCKER compose -f docker-compose.prod.yml pull backend
+# ---------- 7. Build the backend image ----------
+$DOCKER compose -f docker-compose.prod.yml build backend
 
 # ---------- 8. Bootstrap a self-signed cert so Nginx can start ----------
 $DOCKER compose -f docker-compose.prod.yml run --rm --entrypoint \

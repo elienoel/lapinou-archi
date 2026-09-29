@@ -16,7 +16,9 @@ services:
       retries: 10
 
   backend:
-    image: ${BACKEND_IMAGE}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
     container_name: lapinou_backend
     restart: unless-stopped
     env_file:
