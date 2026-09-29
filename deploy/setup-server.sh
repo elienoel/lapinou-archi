@@ -32,7 +32,7 @@ REPO_URL="https://github.com/elienoel/lapinou-archi.git"
 # Backend app repo: contains the Django source + Dockerfile.
 BACKEND_REPO_URL="https://github.com/elienoel/lapinou-backend.git"
 BRANCH="prod"
-DEPLOY_PATH="/opt/lapinou"
+DEPLOY_PATH="/projects/lapinou-archi"
 DB_NAME="lapinou"
 DB_USER="lapinou"
 DB_PASSWORD=""
