@@ -1,26 +1,13 @@
 # Generated from nginx.conf.template by setup-server.sh (envsubst on ${DOMAIN}).
 # Do not edit deploy/nginx.conf directly -- re-run setup-server.sh instead.
+#
+# Plain HTTP only: this container is not exposed to the internet directly.
+# TLS termination and the public 80/443 ports are handled by the host-level
+# Nginx, which reverse-proxies ${DOMAIN} to 127.0.0.1:8010 (see deploy/README.md).
 
 server {
     listen 80;
     server_name ${DOMAIN};
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl;
-    http2 on;
-    server_name ${DOMAIN};
-
-    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
 
     client_max_body_size 20M;
 

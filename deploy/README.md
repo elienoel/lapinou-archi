@@ -13,6 +13,11 @@ Le serveur a donc besoin de ses propres identifiants Git pour cloner/pull **les 
 de déploiement SSH GitHub, ou URL HTTPS contenant un token) — sans ça, `setup-server.sh`/`deploy.sh`
 échoueront sur le `git clone`/`pull`.
 
+Le serveur héberge déjà d'autres projets derrière un Nginx système qui occupe les ports 80/443.
+Le conteneur `lapinou_nginx` n'écoute donc **pas** sur ces ports : il écoute en HTTP simple sur
+`127.0.0.1:8010`, et c'est ce Nginx système qui fait la terminaison TLS et le reverse proxy vers ce
+port (voir section 2 ci-dessous).
+
 CI/CD : un `push` sur la branche `prod` du dépôt `lapinou-backend` déclenche
 `backend/.github/workflows/deploy-prod.yml`, qui se connecte en SSH au serveur et exécute
 `deploy/deploy.sh` (celui-ci pull les deux dépôts et rebuild l'image sur place).
@@ -41,19 +46,20 @@ serveur (copie manuelle, ou `curl` depuis `lapinou-archi` une fois le premier pu
 
 ```bash
 chmod +x setup-server.sh
-./setup-server.sh \
-  --domain api.lapinou.example \
-  --email admin@lapinou.example
+./setup-server.sh --domain api.lapinou.example --email admin@lapinou.example
 ```
 
 Le script va demander en entrée cachée (jamais en argument visible) :
 - le mot de passe PostgreSQL,
 - la `SECRET_KEY` Django (laisse vide pour en générer une automatiquement).
 
-Il installe Docker, clone `lapinou-archi` (branche `prod`) dans `/opt/lapinou` et `lapinou-backend`
-dans `/opt/lapinou/backend`, génère `.env` et `deploy/nginx.conf`, build l'image backend, obtient un
-certificat Let's Encrypt via Certbot, puis démarre PostgreSQL + backend + Nginx + le renouvellement
-automatique du certificat.
+Il installe Docker, clone `lapinou-archi` (branche `prod`) et `lapinou-backend` (dans
+`<deploy-path>/backend`), génère `.env` et `deploy/nginx.conf`, build l'image backend, démarre
+PostgreSQL + backend + Nginx (ce dernier n'écoutant que sur `127.0.0.1:8010`), **puis configure lui-même
+le Nginx système** : il installe `nginx`/`certbot` si besoin, écrit le vhost qui reverse-proxy
+`$DOMAIN` vers `127.0.0.1:8010` (`/etc/nginx/sites-available/$DOMAIN` ou `/etc/nginx/conf.d/$DOMAIN.conf`
+selon ta convention existante), recharge Nginx, puis lance `certbot --nginx` pour obtenir le
+certificat et activer la redirection HTTPS. Rien à faire à la main après coup.
 
 **Pré-requis avant de lancer ce script** : le DNS du domaine doit déjà pointer vers l'IP du serveur.
 
@@ -65,14 +71,14 @@ deux dépôts et rebuild l'image backend sur le serveur.
 Pour déployer manuellement depuis le serveur :
 
 ```bash
-cd /opt/lapinou
+cd <deploy-path>   # ex. /opt/lapinou ou /projects/lapinou-archi
 ./deploy/deploy.sh
 ```
 
 ## 4. Notes de sécurité
 
 - `.env` et `deploy/nginx.conf` sont générés sur le serveur et ignorés par Git (jamais commités).
-- Le renouvellement du certificat Let's Encrypt tourne en continu via le conteneur `certbot`
-  (`docker-compose.prod.yml`).
+- Le renouvellement du certificat Let's Encrypt est géré par le certbot système (celui déjà en
+  place pour les autres domaines de ce serveur), pas par un conteneur dédié.
 - `CORS_ALLOW_ALL_ORIGINS` est actuellement à `True` dans `core/settings.py` (hérité du dev) :
   à restreindre si l'API ne doit être appelée que par l'app mobile officielle.

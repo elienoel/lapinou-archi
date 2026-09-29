@@ -5,8 +5,14 @@
 #
 # It installs Docker, clones the infra repo (docker-compose.prod.yml +
 # deploy/) and the backend app repo (source + Dockerfile), generates the
-# .env file, builds the backend image locally, and obtains a Let's Encrypt
-# SSL certificate via Nginx + Certbot.
+# .env file, builds + starts the stack, and wires up the host-level Nginx
+# (vhost + Let's Encrypt cert via certbot's nginx plugin) for $DOMAIN.
+#
+# This server already runs a host-level Nginx for other domains and owns
+# ports 80/443, so the lapinou nginx container only listens on
+# 127.0.0.1:8010 (plain HTTP); this script adds a host Nginx vhost that
+# reverse-proxies $DOMAIN to that port and runs `certbot --nginx` to get
+# the real certificate -- nothing left to do by hand.
 #
 # Both repos are private, so the server needs its own git credentials for
 # each (SSH deploy key, or an HTTPS URL containing a token) -- see --repo
@@ -18,9 +24,7 @@
 # them with hidden input.
 #
 # Usage example:
-#   ./setup-server.sh \
-#     --domain api.lapinou.example \
-#     --email admin@lapinou.example
+#   ./setup-server.sh --domain api.lapinou.example --email admin@lapinou.example
 #
 # (DB password / secret key will then be prompted interactively.)
 
@@ -157,34 +161,48 @@ echo ".env written to $DEPLOY_PATH/.env"
 DOMAIN="$DOMAIN" envsubst '${DOMAIN}' < deploy/nginx.conf.template > deploy/nginx.conf
 echo "deploy/nginx.conf generated for domain $DOMAIN"
 
-# ---------- 7. Build the backend image ----------
+# ---------- 7. Build the backend image and start the stack ----------
 $DOCKER compose -f docker-compose.prod.yml build backend
-
-# ---------- 8. Bootstrap a self-signed cert so Nginx can start ----------
-$DOCKER compose -f docker-compose.prod.yml run --rm --entrypoint \
-  "mkdir -p /etc/letsencrypt/live/$DOMAIN" certbot
-
-$DOCKER compose -f docker-compose.prod.yml run --rm --entrypoint "\
-  openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
-  -keyout /etc/letsencrypt/live/$DOMAIN/privkey.pem \
-  -out /etc/letsencrypt/live/$DOMAIN/fullchain.pem \
-  -subj /CN=localhost" certbot
-
-# ---------- 9. Start db, backend, nginx (with the temporary cert) ----------
-$DOCKER compose -f docker-compose.prod.yml up -d db backend nginx
-
-# ---------- 10. Replace the dummy cert with a real Let's Encrypt cert ----------
-$DOCKER compose -f docker-compose.prod.yml run --rm --entrypoint "\
-  rm -Rf /etc/letsencrypt/live/$DOMAIN /etc/letsencrypt/archive/$DOMAIN /etc/letsencrypt/renewal/$DOMAIN.conf" certbot
-
-$DOCKER compose -f docker-compose.prod.yml run --rm --entrypoint "\
-  certbot certonly --webroot -w /var/www/certbot \
-  --email $EMAIL -d $DOMAIN --rsa-key-size 4096 --agree-tos --non-interactive" certbot
-
-$DOCKER compose -f docker-compose.prod.yml exec nginx nginx -s reload
-
-# ---------- 11. Start everything, including the certbot renewal loop ----------
 $DOCKER compose -f docker-compose.prod.yml up -d
+
+# ---------- 8. Install nginx/certbot on the host if needed ----------
+if ! command -v nginx >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends nginx certbot python3-certbot-nginx
+fi
+
+# ---------- 9. Host Nginx vhost: reverse-proxy $DOMAIN to the container ----------
+if [ -d /etc/nginx/sites-enabled ]; then
+    VHOST_PATH="/etc/nginx/sites-available/$DOMAIN"
+else
+    VHOST_PATH="/etc/nginx/conf.d/$DOMAIN.conf"
+fi
+
+sudo tee "$VHOST_PATH" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name ${DOMAIN};
+
+    location / {
+        proxy_pass http://127.0.0.1:8010;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+if [ -d /etc/nginx/sites-enabled ]; then
+    sudo ln -sf "$VHOST_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
+fi
+
+sudo nginx -t
+sudo systemctl reload nginx
+echo "Host Nginx vhost written to $VHOST_PATH and reloaded."
+
+# ---------- 10. Get/renew the Let's Encrypt certificate ----------
+sudo certbot --nginx -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive --redirect
 
 echo
 echo "Setup complete. The backend should now be reachable at https://$DOMAIN"
